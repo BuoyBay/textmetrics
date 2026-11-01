@@ -1,0 +1,114 @@
+Import textmetrics.TextMetrics
+
+#If TargetLinux Then
+Private Optional Declare Function GTKReady Lib "libgtk-4.so.1" Alias "gtk_is_initialized" () As Int32
+Private Optional Declare Function GTKSettings Lib "libgtk-4.so.1" Alias "gtk_settings_get_default" () As Ptr
+Private Optional Declare Sub GetFontSetting Lib "libgobject-2.0.so.0" Alias "g_object_get" (settings As Ptr, name As String, ByRef output As Ptr, terminator As Ptr)
+Private Optional Declare Sub FreeSetting Lib "libglib-2.0.so.0" Alias "g_free" (output As Ptr)
+Private Optional Declare Function ReadDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_from_string" (description As String) As Ptr
+Private Optional Declare Sub DestroyDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_free" (description As Ptr)
+Private Optional Declare Function DescriptionFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_get_family" (description As Ptr) As String
+Private Optional Declare Function DescriptionSize Lib "libpango-1.0.so.0" Alias "pango_font_description_get_size" (description As Ptr) As Int32
+Private Optional Declare Function DescriptionAbsolute Lib "libpango-1.0.so.0" Alias "pango_font_description_get_size_is_absolute" (description As Ptr) As Int32
+Private Optional Declare Function WidgetFontContext Lib "libgtk-4.so.1" Alias "gtk_widget_get_pango_context" (widget As Ptr) As Ptr
+Private Optional Declare Function ContextDPI Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_context_get_resolution" (context As Ptr) As Double
+Private Optional Declare Function ContextMap Lib "libpango-1.0.so.0" Alias "pango_context_get_font_map" (context As Ptr) As Ptr
+Private Optional Declare Function CairoMapType Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_font_map_get_type" () As UInt64
+Private Optional Declare Function IsNativeType Lib "libgobject-2.0.so.0" Alias "g_type_check_instance_is_a" (instance As Ptr, nativeType As UInt64) As Int32
+Private Optional Declare Function MapDPI Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_font_map_get_resolution" (map As Ptr) As Double
+#End If
+
+''' Requires an already initialized GTK 4 default display; never initializes GTK.
+Public Function GTKSystemFontSupported() As Boolean
+    #If TargetLinux Then
+        If Not System.IsLibraryAvailable("libgtk-4.so.1") Or Not NativeMetricsSupported() Then Return False
+        Return GTKReady() <> 0 And GTKSettings() <> Nil
+    #Else
+        Return False
+    #End If
+End Function
+
+''' Read the actual widget Pango context/map resolution, without guessing 96 DPI.
+Public Function GTKFontDPI(control As TextControl) As Double
+    If control = Nil Then Throw New InvalidArgumentException("Text control is Nil")
+    If Not GTKSystemFontSupported() Then Throw New UnsupportedOperationException("An initialized GTK display is required")
+    #If TargetLinux Then
+        If control.NativeWidget = Nil Then Throw New InvalidArgumentException("Text control has no native widget")
+        Dim context As Ptr = WidgetFontContext(control.NativeWidget)
+        If context = Nil Then Throw New UnsupportedOperationException("Widget has no Pango context")
+        Dim dpi As Double = ContextDPI(context)
+        If dpi <= 0.0 Then
+            Dim map As Ptr = ContextMap(context)
+            If map = Nil Or IsNativeType(map, CairoMapType()) = 0 Then Throw New UnsupportedOperationException("Widget font map has no Cairo resolution")
+            dpi = MapDPI(map)
+        End If
+        If Not (dpi >= 1.0 And dpi <= 9600.0) Then Throw New UnsupportedOperationException("Widget font resolution is invalid")
+        Return dpi
+    #Else
+        Throw New UnsupportedOperationException("GTK font DPI requires Linux GTK 4")
+    #End If
+End Function
+
+''' Opt-in adaptation for the tested Buoy 0.72.0 GTK FontSize pixel behavior.
+''' Do not use after upstream changes FontSize to true typographic point units.
+Public Function ApplyGTKPointFont0720(control As TextControl, family As String, pointSize As Double) As FontResolution
+    Dim dpi As Double = GTKFontDPI(control)
+    Dim request As New FontRequest(family, pointSize)
+    request.DPI = dpi
+    If control <> Nil Then
+        request.Bold = control.Bold
+        request.Italic = control.Italic
+    End If
+    Dim resolved As FontResolution = ResolveFont(request)
+    Dim pixels As Double = pointSize * dpi / 72.0
+    If pixels > 16384.0 Then Throw New InvalidArgumentException("Converted GTK font exceeds 16384 pixels")
+    control.FontName = family
+    control.FontSize = pixels
+    Return resolved
+End Function
+
+''' Snapshot the current default-display gtk-font-name. Does not inspect widget CSS.
+Public Function GTKSystemFontDescription() As String
+    If Not GTKSystemFontSupported() Then Throw New UnsupportedOperationException("Initialize GTK 4 on the GUI thread with a default display before querying its font")
+    #If TargetLinux Then
+        Dim output As Ptr = Nil
+        Try
+            GetFontSetting(GTKSettings(), "gtk-font-name", output, Nil)
+            If output = Nil Then Throw New UnsupportedOperationException("GTK default font setting unavailable")
+            Return CType(CType(output, CString), String)
+        Finally
+            If output <> Nil Then FreeSetting(output)
+        End Try
+    #Else
+        Throw New UnsupportedOperationException("GTK system font adapter requires Linux GTK 4")
+    #End If
+End Function
+
+''' GTK uses family and size from gtk-font-name; native Pango resolves the base face.
+''' Zero size follows the setting, otherwise explicit point size overrides it.
+Public Function ResolveGTKSystemFont(size As Double = 0.0, dpi As Double = 96.0) As FontResolution
+    If Not (size >= 0.0 And size <= 16384.0) Then Throw New InvalidArgumentException("GTK font size must be finite and nonnegative")
+    If Not (dpi >= 1.0 And dpi <= 9600.0) Then Throw New InvalidArgumentException("GTK font DPI must be finite and in 1..9600")
+    Dim setting As String = GTKSystemFontDescription()
+    #If TargetLinux Then
+        Dim description As Ptr = ReadDescription(setting)
+        If description = Nil Then Throw New UnsupportedOperationException("Cannot parse GTK font description")
+        Try
+            Dim family As String = DescriptionFamily(description)
+            Dim pointSize As Double = size
+            If pointSize = 0.0 Then
+                pointSize = DescriptionSize(description) / 1024.0
+                If DescriptionAbsolute(description) <> 0 Then pointSize = pointSize * 72.0 / dpi
+            End If
+            If family = "" Or pointSize <= 0.0 Then Throw New UnsupportedOperationException("GTK font setting requires a family and positive size")
+            If String.Contains(family, ",") Then Throw New UnsupportedOperationException("GTK font family lists require a list-aware resolver; this adapter accepts one family")
+            Dim request As New FontRequest(family, pointSize)
+            request.DPI = dpi
+            Return ResolveFont(request)
+        Finally
+            DestroyDescription(description)
+        End Try
+    #Else
+        Throw New UnsupportedOperationException("GTK system font adapter requires Linux GTK 4")
+    #End If
+End Function

@@ -1,0 +1,379 @@
+' Native base-face metrics; no drawing, enumeration, registration or glyph promises.
+Public Enum FontRole As Integer
+    Family = 0
+    System = 1
+    SmallSystem = 2
+    BackendDefault = 3
+End Enum
+
+Public Enum BaseFaceMatch As Integer
+    NotCompared = 0
+    FamilyNameMatches = 1
+    DifferentNameOrAlias = 2
+End Enum
+
+Public Class FontRequest
+    Public Property Role As FontRole = FontRole.Family
+    Public Property Family As String = ""
+    ' Zero requests the native role size; only valid for System/SmallSystem.
+    Public Property PointSize As Double = 12.0
+    Public Property Bold As Boolean = False
+    Public Property Italic As Boolean = False
+    Public Property DPI As Double = 96.0
+    Public Property Language As String = ""
+
+    Public Sub Constructor(familyName As String, size As Double)
+        Family = familyName
+        PointSize = size
+    End Sub
+End Class
+
+Public Class FontResolution
+    Public Property RequestedFamily As String
+    Public Property RequestedRole As FontRole
+    Public Property RequestedPointSize As Double
+    Public Property RequestedBold As Boolean
+    Public Property RequestedItalic As Boolean
+    Public Property DPI As Double
+    Public Property Language As String
+    Public Property Backend As String
+    Public Property ResolvedFamily As String
+    Public Property ResolvedFace As String
+    Public Property ResolvedPostScriptName As String
+    Public Property ResolvedPointSize As Double
+    Public Property ResolvedBold As Boolean
+    Public Property ResolvedItalic As Boolean
+    Public Property StyleMatches As Boolean
+    Public Property BaseMatch As BaseFaceMatch = BaseFaceMatch.NotCompared
+    Public Property Ascent As Double
+    Public Property Descent As Double
+    Public Property Leading As Double
+    Public Property LineSpacing As Double
+    Public Property NativeLineSpacingAvailable As Boolean = False
+    ' This package resolves one base face, never shaped runs or per-glyph fallback.
+    Public Property GlyphFallbackKnown As Boolean = False
+End Class
+
+Public Function NativeMetricsSupported() As Boolean
+    #If TargetLinux Then
+        If Not System.IsLibraryAvailable("libpangocairo-1.0.so.0") Or Not System.IsLibraryAvailable("libpango-1.0.so.0") Or Not System.IsLibraryAvailable("libgobject-2.0.so.0") Or Not System.IsLibraryAvailable("libglib-2.0.so.0") Then Return False
+        Return PangoVersion() >= 14400
+    #ElseIf TargetMac Then
+        Return True
+    #ElseIf TargetWindows Then
+        Return System.IsLibraryAvailable("gdi32") And System.IsLibraryAvailable("user32")
+    #Else
+        Return False
+    #End If
+End Function
+
+Public Function NativeRoleSupported(role As FontRole) As Boolean
+    If Not NativeMetricsSupported() Then Return False
+    #If TargetMac Then
+        Return role = FontRole.Family Or role = FontRole.System Or role = FontRole.SmallSystem
+    #ElseIf TargetLinux Then
+        Return role = FontRole.Family Or role = FontRole.BackendDefault
+    #ElseIf TargetWindows Then
+        Return role = FontRole.Family Or role = FontRole.System Or role = FontRole.BackendDefault
+    #Else
+        Return False
+    #End If
+End Function
+
+Private Sub Validate(request As FontRequest)
+    If request = Nil Then Throw New InvalidArgumentException("Font request is Nil")
+    If request.Role <> FontRole.Family And request.Role <> FontRole.System And request.Role <> FontRole.SmallSystem And request.Role <> FontRole.BackendDefault Then Throw New InvalidArgumentException("Invalid font role")
+    ' Bounded comparisons reject NaN, infinity and unreasonable native integer sizes.
+    If Not (request.DPI >= 1.0 And request.DPI <= 9600.0) Then Throw New InvalidArgumentException("DPI must be finite and in 1..9600")
+    If Not (request.PointSize >= 0.0 And request.PointSize <= 16384.0) Then Throw New InvalidArgumentException("Point size must be finite and in 0..16384")
+    If request.PointSize = 0.0 And request.Role <> FontRole.System And request.Role <> FontRole.SmallSystem Then Throw New InvalidArgumentException("Explicit and backend-default requests require a positive point size")
+    If request.PointSize > 0.0 And request.PointSize < 0.015625 Then Throw New InvalidArgumentException("Point size must be at least 1/64 point")
+    If request.PointSize * request.DPI / 72.0 > 65536.0 Then Throw New InvalidArgumentException("Font size exceeds 65536 device units")
+    For Each character As String In String.Chars(request.Family + request.Language)
+        Dim codepoint As Integer = String.Asc(character)
+        If codepoint < 32 Or codepoint = 127 Then Throw New InvalidArgumentException("Font family/language cannot contain control characters")
+    Next
+    If request.Role = FontRole.Family Then
+        If String.Trim(request.Family) = "" Then Throw New InvalidArgumentException("Family request requires a name")
+        If String.Contains(request.Family, ",") Then Throw New InvalidArgumentException("Request a single family, not a fallback list")
+    Else
+        If request.Family <> "" Then Throw New InvalidArgumentException("Role requests must leave Family empty")
+    End If
+End Sub
+
+Public Function ResolveFont(request As FontRequest) As FontResolution
+    Validate(request)
+    If Not NativeRoleSupported(request.Role) Then Throw New UnsupportedOperationException("Native font role/backend is unsupported; supply an explicit family and size on a supported backend")
+    Dim resolved As New FontResolution()
+    resolved.RequestedFamily = request.Family
+    resolved.RequestedRole = request.Role
+    resolved.RequestedPointSize = request.PointSize
+    resolved.RequestedBold = request.Bold
+    resolved.RequestedItalic = request.Italic
+    resolved.DPI = request.DPI
+    resolved.Language = request.Language
+    #If TargetLinux Then
+        ResolvePango(request, resolved)
+    #ElseIf TargetMac Then
+        ResolveCoreText(request, resolved)
+    #ElseIf TargetWindows Then
+        ResolveGDI(request, resolved)
+    #End If
+    resolved.StyleMatches = (resolved.ResolvedBold = request.Bold) And (resolved.ResolvedItalic = request.Italic)
+    If request.Role = FontRole.Family Then
+        If String.LCase(String.Trim(request.Family)) = String.LCase(resolved.ResolvedFamily) Then
+            resolved.BaseMatch = BaseFaceMatch.FamilyNameMatches
+        Else
+            resolved.BaseMatch = BaseFaceMatch.DifferentNameOrAlias
+        End If
+    End If
+    Return resolved
+End Function
+
+#If TargetLinux Then
+Private Optional Declare Function PangoVersion Lib "libpango-1.0.so.0" Alias "pango_version" () As Int32
+Private Optional Declare Function PangoMap Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_font_map_get_default" () As Ptr
+Private Optional Declare Sub SetDPI Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_context_set_resolution" (context As Ptr, dpi As Double)
+Private Optional Declare Function MakeContext Lib "libpango-1.0.so.0" Alias "pango_font_map_create_context" (map As Ptr) As Ptr
+Private Optional Declare Function NewDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_new" () As Ptr
+Private Optional Declare Function ContextDescription Lib "libpango-1.0.so.0" Alias "pango_context_get_font_description" (context As Ptr) As Ptr
+Private Optional Declare Function CopyDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_copy" (description As Ptr) As Ptr
+Private Optional Declare Sub FreeDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_free" (description As Ptr)
+Private Optional Declare Sub SetFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_set_family" (description As Ptr, family As String)
+Private Optional Declare Sub SetSize Lib "libpango-1.0.so.0" Alias "pango_font_description_set_size" (description As Ptr, size As Int32)
+Private Optional Declare Sub SetWeight Lib "libpango-1.0.so.0" Alias "pango_font_description_set_weight" (description As Ptr, weight As Int32)
+Private Optional Declare Sub SetStyle Lib "libpango-1.0.so.0" Alias "pango_font_description_set_style" (description As Ptr, style As Int32)
+Private Optional Declare Function LoadFont Lib "libpango-1.0.so.0" Alias "pango_font_map_load_font" (map As Ptr, context As Ptr, description As Ptr) As Ptr
+Private Optional Declare Function DescribeFont Lib "libpango-1.0.so.0" Alias "pango_font_describe" (font As Ptr) As Ptr
+Private Optional Declare Function GetFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_get_family" (description As Ptr) As String
+Private Optional Declare Function GetSize Lib "libpango-1.0.so.0" Alias "pango_font_description_get_size" (description As Ptr) As Int32
+Private Optional Declare Function GetWeight Lib "libpango-1.0.so.0" Alias "pango_font_description_get_weight" (description As Ptr) As Int32
+Private Optional Declare Function GetStyle Lib "libpango-1.0.so.0" Alias "pango_font_description_get_style" (description As Ptr) As Int32
+Private Optional Declare Function DescriptionText Lib "libpango-1.0.so.0" Alias "pango_font_description_to_string" (description As Ptr) As CString
+Private Optional Declare Function GetLanguage Lib "libpango-1.0.so.0" Alias "pango_language_from_string" (language As String) As Ptr
+Private Optional Declare Function DefaultLanguage Lib "libpango-1.0.so.0" Alias "pango_language_get_default" () As Ptr
+Private Optional Declare Sub SetContextLanguage Lib "libpango-1.0.so.0" Alias "pango_context_set_language" (context As Ptr, language As Ptr)
+Private Optional Declare Function GetMetrics Lib "libpango-1.0.so.0" Alias "pango_font_get_metrics" (font As Ptr, language As Ptr) As Ptr
+Private Optional Declare Function GetAscent Lib "libpango-1.0.so.0" Alias "pango_font_metrics_get_ascent" (metrics As Ptr) As Int32
+Private Optional Declare Function GetDescent Lib "libpango-1.0.so.0" Alias "pango_font_metrics_get_descent" (metrics As Ptr) As Int32
+Private Optional Declare Function GetHeight Lib "libpango-1.0.so.0" Alias "pango_font_metrics_get_height" (metrics As Ptr) As Int32
+Private Optional Declare Sub UnrefMetrics Lib "libpango-1.0.so.0" Alias "pango_font_metrics_unref" (metrics As Ptr)
+Private Optional Declare Sub UnrefObject Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Sub FreeText Lib "libglib-2.0.so.0" Alias "g_free" (text As Ptr)
+
+Private Sub ResolvePango(request As FontRequest, resolved As FontResolution)
+    Dim context As Ptr = Nil
+    Dim description As Ptr = Nil
+    Dim font As Ptr = Nil
+    Dim actual As Ptr = Nil
+    Dim metrics As Ptr = Nil
+    Try
+        Dim map As Ptr = PangoMap()
+        If map = Nil Then Throw New UnsupportedOperationException("PangoCairo default font map unavailable")
+        context = MakeContext(map)
+        If context = Nil Then Throw New UnsupportedOperationException("Pango context unavailable")
+        SetDPI(context, request.DPI)
+        Dim language As Ptr = DefaultLanguage()
+        If request.Language <> "" Then language = GetLanguage(request.Language)
+        SetContextLanguage(context, language)
+        If request.Role = FontRole.BackendDefault Then
+            Dim borrowed As Ptr = ContextDescription(context)
+            If borrowed = Nil Then Throw New UnsupportedOperationException("Pango backend default description unavailable")
+            description = CopyDescription(borrowed)
+        Else
+            description = NewDescription()
+        End If
+        If description = Nil Then Throw New UnsupportedOperationException("Pango font description unavailable")
+        If request.Role = FontRole.Family Then SetFamily(description, request.Family)
+        Dim nativeSize As Int32 = request.PointSize * 1024.0
+        SetSize(description, nativeSize)
+        Dim weight As Int32 = 400
+        If request.Bold Then weight = 700
+        Dim style As Int32 = 0
+        If request.Italic Then style = 2
+        SetWeight(description, weight)
+        SetStyle(description, style)
+        font = LoadFont(map, context, description)
+        If font = Nil Then Throw New UnsupportedOperationException("Pango could not resolve a base font")
+        actual = DescribeFont(font)
+        If actual = Nil Then Throw New UnsupportedOperationException("Pango resolved description unavailable")
+        resolved.Backend = "PangoCairo base font (Pango >= 1.44)"
+        resolved.ResolvedFamily = GetFamily(actual)
+        Dim label As CString = DescriptionText(actual)
+        If label <> Nil Then
+            resolved.ResolvedFace = CType(label, String)
+            FreeText(label)
+        End If
+        resolved.ResolvedPointSize = GetSize(actual) / 1024.0
+        resolved.ResolvedBold = GetWeight(actual) >= 600
+        resolved.ResolvedItalic = GetStyle(actual) <> 0
+        metrics = GetMetrics(font, language)
+        If metrics = Nil Then Throw New UnsupportedOperationException("Pango base-font metrics unavailable")
+        Dim scale As Double = 72.0 / request.DPI / 1024.0
+        resolved.Ascent = GetAscent(metrics) * scale
+        resolved.Descent = GetDescent(metrics) * scale
+        Dim height As Integer = GetHeight(metrics)
+        resolved.NativeLineSpacingAvailable = height > 0
+        resolved.LineSpacing = height * scale
+        If height <= 0 Then resolved.LineSpacing = resolved.Ascent + resolved.Descent
+        resolved.Leading = resolved.LineSpacing - resolved.Ascent - resolved.Descent
+    Finally
+        If metrics <> Nil Then UnrefMetrics(metrics)
+        If actual <> Nil Then FreeDescription(actual)
+        If font <> Nil Then UnrefObject(font)
+        If description <> Nil Then FreeDescription(description)
+        If context <> Nil Then UnrefObject(context)
+    End Try
+End Sub
+#End If
+
+#If TargetMac Then
+Private Declare Function MacResolve Lib "buoy_textmetrics" Alias "btm_resolve" (family As String, role As Integer, size As Double, bold As Integer, italic As Integer, language As String) As Ptr
+Private Declare Function MacError Lib "buoy_textmetrics" Alias "btm_error" (snapshot As Ptr) As String
+Private Declare Function MacName Lib "buoy_textmetrics" Alias "btm_name" (snapshot As Ptr, field As Integer) As String
+Private Declare Function MacValue Lib "buoy_textmetrics" Alias "btm_value" (snapshot As Ptr, field As Integer) As Double
+Private Declare Sub MacFree Lib "buoy_textmetrics" Alias "btm_free" (snapshot As Ptr)
+
+Private Sub ResolveCoreText(request As FontRequest, resolved As FontResolution)
+    Dim bold As Integer = 0
+    Dim italic As Integer = 0
+    If request.Bold Then bold = 1
+    If request.Italic Then italic = 1
+    Dim snapshot As Ptr = MacResolve(request.Family, CType(request.Role, Integer), request.PointSize, bold, italic, request.Language)
+    Try
+        Dim message As String = MacError(snapshot)
+        If message <> "" Then Throw New UnsupportedOperationException(message)
+        resolved.Backend = "CoreText base font"
+        resolved.ResolvedFamily = MacName(snapshot, 0)
+        resolved.ResolvedFace = MacName(snapshot, 1)
+        resolved.ResolvedPostScriptName = MacName(snapshot, 2)
+        resolved.ResolvedPointSize = MacValue(snapshot, 0)
+        resolved.Ascent = MacValue(snapshot, 1)
+        resolved.Descent = MacValue(snapshot, 2)
+        resolved.Leading = MacValue(snapshot, 3)
+        resolved.ResolvedBold = MacValue(snapshot, 4) <> 0.0
+        resolved.ResolvedItalic = MacValue(snapshot, 5) <> 0.0
+        resolved.LineSpacing = resolved.Ascent + resolved.Descent + resolved.Leading
+        resolved.NativeLineSpacingAvailable = True
+    Finally
+        MacFree(snapshot)
+    End Try
+End Sub
+#End If
+
+#If TargetWindows Then
+Private Declare Function GDICreateDC Lib "gdi32" Alias "CreateCompatibleDC" (dc As Ptr) As Ptr
+Private Declare Function GDIDeleteDC Lib "gdi32" Alias "DeleteDC" (dc As Ptr) As Int32
+Private Declare Function GDICreateFont Lib "gdi32" Alias "CreateFontIndirectW" (description As Ptr) As Ptr
+Private Declare Function GDISelect Lib "gdi32" Alias "SelectObject" (dc As Ptr, obj As Ptr) As Ptr
+Private Declare Function GDIDelete Lib "gdi32" Alias "DeleteObject" (obj As Ptr) As Int32
+Private Declare Function GDIMetrics Lib "gdi32" Alias "GetTextMetricsW" (dc As Ptr, metrics As Ptr) As Int32
+Private Optional Declare Function GDIFace Lib "gdi32" Alias "GetTextFaceW" (dc As Ptr, count As Int32, text As Ptr) As Int32
+Private Declare Function GDIStock Lib "gdi32" Alias "GetStockObject" (index As Int32) As Ptr
+Private Declare Function GDIObject Lib "gdi32" Alias "GetObjectW" (obj As Ptr, count As Int32, buffer As Ptr) As Int32
+Private Optional Declare Function WindowsUIFonts Lib "user32" Alias "SystemParametersInfoForDpi" (action As UInt32, count As UInt32, buffer As Ptr, options As UInt32, dpi As UInt32) As Int32
+
+Private Function WinZeroes(count As Integer) As Bytes
+    Dim buffer As New Bytes()
+    For i As Integer = 1 To count
+        buffer.Append(0)
+    Next
+    Return buffer
+End Function
+
+Private Sub WinWrite32(buffer As Bytes, offset As Integer, number As Integer)
+    For i As Integer = 0 To 3
+        buffer.SetItem(offset + i, (number >> (i * 8)) And 255)
+    Next
+End Sub
+
+Private Function WinRead32(buffer As Bytes, offset As Integer) As Integer
+    Dim number As Integer = buffer.Item(offset) + buffer.Item(offset + 1) * 256 + buffer.Item(offset + 2) * 65536 + buffer.Item(offset + 3) * 16777216
+    If number >= 2147483648 Then number -= 4294967296
+    Return number
+End Function
+
+Private Function WinWideText(buffer As Bytes) As String
+    Dim wideData As New Bytes()
+    For i As Integer = 0 To buffer.Count - 2 Step 2
+        If buffer.Item(i) = 0 And buffer.Item(i + 1) = 0 Then Exit For
+        wideData.Append(buffer.Item(i))
+        wideData.Append(buffer.Item(i + 1))
+    Next
+    Return String.FromUTF16LE(wideData)
+End Function
+
+Private Sub ResolveGDI(request As FontRequest, resolved As FontResolution)
+    ' LOGFONTW is 92 bytes and TEXTMETRICW is 60 on Win32 and Win64.
+    Dim description As Bytes = WinZeroes(92)
+    Dim dpi As Integer = Math.Round(request.DPI)
+    If dpi < 1 Then dpi = 1
+    ' GDI font heights are integral pixels: use the same rounded DPI for all conversions.
+    Dim nativeDPI As Double = dpi
+    If request.Role = FontRole.System Then
+        ' NONCLIENTMETRICSW: lfMessageFont begins at byte 408, size 504 since Vista.
+        Dim settings As Bytes = WinZeroes(504)
+        WinWrite32(settings, 0, 504)
+        If WindowsUIFonts(41, 504, settings.DataPtr(), 0, dpi) = 0 Then Throw New UnsupportedOperationException("Windows message-font settings unavailable at requested DPI")
+        For i As Integer = 0 To 91
+            description.SetItem(i, settings.Item(408 + i))
+        Next
+    ElseIf request.Role = FontRole.BackendDefault Then
+        If GDIObject(GDIStock(17), 92, description.DataPtr()) <> 92 Then Throw New UnsupportedOperationException("GDI default GUI font unavailable")
+    Else
+        Dim family As Bytes = request.Family.AsUTF16LE()
+        If family.Count > 62 Then Throw New InvalidArgumentException("GDI family name exceeds 31 UTF-16 units")
+        For i As Integer = 0 To family.Count - 1
+            description.SetItem(28 + i, family.Item(i))
+        Next
+        description.SetItem(23, 1) ' DEFAULT_CHARSET
+    End If
+    If request.PointSize > 0.0 Then
+        Dim height As Integer = Math.Round(request.PointSize * nativeDPI / 72.0)
+        If height < 1 Then height = 1
+        WinWrite32(description, 0, -height)
+    End If
+    Dim weight As Integer = 400
+    If request.Bold Then weight = 700
+    WinWrite32(description, 16, weight)
+    description.SetItem(20, 0)
+    If request.Italic Then description.SetItem(20, 1)
+    ' Decoration and rotation are excluded from this base-face API.
+    description.SetItem(21, 0)
+    description.SetItem(22, 0)
+    WinWrite32(description, 4, 0)
+    WinWrite32(description, 8, 0)
+    WinWrite32(description, 12, 0)
+    Dim dc As Ptr = GDICreateDC(Nil)
+    If dc = Nil Then Throw New UnsupportedOperationException("GDI device context unavailable")
+    Dim font As Ptr = Nil
+    Dim previous As Ptr = Nil
+    Try
+        font = GDICreateFont(description.DataPtr())
+        If font = Nil Then Throw New UnsupportedOperationException("GDI font creation failed")
+        previous = GDISelect(dc, font)
+        If previous = Nil Then Throw New UnsupportedOperationException("GDI font selection failed")
+        Dim metrics As Bytes = WinZeroes(60)
+        If GDIMetrics(dc, metrics.DataPtr()) = 0 Then Throw New UnsupportedOperationException("GDI font metrics unavailable")
+        Dim characters As Integer = GDIFace(dc, 0, Nil)
+        If characters <= 0 Or characters > 4096 Then Throw New UnsupportedOperationException("GDI resolved face unavailable")
+        Dim face As Bytes = WinZeroes(characters * 2)
+        If GDIFace(dc, characters, face.DataPtr()) = 0 Then Throw New UnsupportedOperationException("GDI resolved face read failed")
+        resolved.Backend = "Windows GDI selected base font (message-font System role)"
+        resolved.ResolvedFamily = WinWideText(face)
+        resolved.ResolvedFace = resolved.ResolvedFamily
+        resolved.ResolvedPointSize = (WinRead32(metrics, 0) - WinRead32(metrics, 12)) * 72.0 / nativeDPI
+        resolved.ResolvedBold = WinRead32(metrics, 28) >= 600
+        resolved.ResolvedItalic = metrics.Item(52) <> 0
+        resolved.Ascent = WinRead32(metrics, 4) * 72.0 / nativeDPI
+        resolved.Descent = WinRead32(metrics, 8) * 72.0 / nativeDPI
+        resolved.Leading = WinRead32(metrics, 16) * 72.0 / nativeDPI
+        resolved.LineSpacing = resolved.Ascent + resolved.Descent + resolved.Leading
+        resolved.NativeLineSpacingAvailable = True
+    Finally
+        If previous <> Nil Then GDISelect(dc, previous)
+        If font <> Nil Then GDIDelete(font)
+        GDIDeleteDC(dc)
+    End Try
+End Sub
+#End If
