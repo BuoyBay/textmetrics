@@ -1,4 +1,4 @@
-# Resolve fonts and measure text in logical points
+# Font resolution and text metrics in logical points
 
 `textmetrics` implements Explicit font requests, native base-face resolution and logical-point metrics.
 
