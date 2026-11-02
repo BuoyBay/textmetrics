@@ -1,15 +1,14 @@
 # TextMetrics 0.1.0
 
 Explicit font requests, observable native base-face resolution, and font metrics
-for Buoy 0.72.0. Import `textmetrics.TextMetrics` (or `textmetrics` for the core API). The checked usage example and executable
-specification are textmetrics_native_test.bui.
+for Buoy 0.72.0. Import `textmetrics.TextMetrics` (or `textmetrics` for the core API).
 No renderer, face enumeration, font installation, file registration or glyph
 coverage API is included. FontKit owns discovery and registration; ShapingKit
 owns Linux shaped text drawing and measurement.
 
 ## Capability
 
-| Platform | Explicit family | System / small system | Backend default | Runtime evidence |
+| Platform | Explicit family | System / small system | Backend default | Runtime scope |
 | --- | --- | --- | --- | --- |
 | Linux, both architectures | PangoCairo base font, Pango >= 1.44 | Explicitly unsupported | Pango context's family at caller's explicit point size | x86_64 Linux native tests and direct Pango reference comparison |
 | macOS, both architectures | Core Text matching | `CTFontCreateUIFontForLanguage`: system / smallSystem; zero size requests native default | Unsupported | ARM64 native suite and independent Swift/CoreText reference with stock linker resources |
@@ -48,8 +47,6 @@ resolver. The result retains an explicit family request; it does not pretend to 
 Linux System role. No small-system size is guessed. Serialized font registration
 and resolution rules still apply.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 ## Explicit GTK point conversion for Buoy 0.72.0
 
 Native inspection on this Linux x86-64 build shows `TextControl.FontSize = 24`
@@ -68,15 +65,7 @@ layout: an 18-point helper request at 96 DPI matches the 24-pixel fixture run.
 The TextField's private display layout and other platforms' control units are
 not inferred from that narrower entry-context check.
 
-A fresh independent review passed at process-local GTK96/192DPI with unit device
-scale, including regular/bold/italic/bold-italic runs, invalid and Nil requests,
-Pango-map DPI fallback and unchanged GTK settings. See
-review and exact scope.
-These checks establish logical Pango/Cairo units, not measured physical sizing.
-A separate device-scale regression
-also verifies actual widget scale factors 1 and 2 at both DPI settings, including
-all four bold/italic combinations. It uses private Xvfb displays; physical
-high-DPI hardware remains outside the evidence.
+GTK point conversion operates in logical Pango/Cairo units. It does not establish physical display sizing or infer another control backend's text units.
 
 ## Requests and results
 
@@ -178,37 +167,11 @@ The backend must match the renderer for layout to agree:
   registration keys. Measure using the PDF backend for PDF output; this package
   does not embed fonts or guarantee PDF metrics match screen rendering.
 
-## Build and evidence
+## Build
 
-Run `python3 tools/build_textmetrics.py`. It seals into an isolated temporary
-workspace, checks every package module and the core consumer for all six targets, parses
-`errors` even on successful compiler exits, reads warnings, compiles/runs the
-host consumer, and publishes identical archives to:
-
-- `packages/textmetrics-0.1.0.buipkg`
-- `dist/textmetrics-0.1.0.buipkg`
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-`--check-only` runs verification without publishing. `--skip-runtime` explicitly
-requests compiler-only verification. On Linux the default run also invokes
-textmetrics_native_reference.py,
-which compares the compiled consumer against direct ctypes/Pango metrics at
-96 and 192 DPI. It fails if no native reference metrics are produced.
-
-The 2026-10-31 x86_64 Linux run passed the initial twelve core source/target compiler checks
-with empty errors and warnings, input rejection (including NaN/infinity), native
-identity/style resolution, a deliberately missing family, size/DPI scaling,
-unsupported Linux system roles, 100 repeated resolutions, and both native
-reference comparisons. This host resolved Pango's default to DejaVu Serif 12,
-with ascent/descent/spacing 11.25/3/14.25 points at both tested DPIs; those names
-and numbers are observations, not package constants. Native Mac and Windows
-verification is described separately below. Repeated calls exercise cleanup paths;
-no leak-instrumentation result is claimed.
+See the [TextMetrics source guide](https://github.com/BuoyBay/textmetrics/blob/main/README.md) for package installation and native library prerequisites. Build a target-specific native bridge before sealing when adding a runtime slice.
 
 ## Remaining implementation work and upstream patch requirements
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
 
 This checkout packages Buoy and libraries; upstream built-in compiler/runtime
 implementations were not found among its sources. Library work cannot change
@@ -250,16 +213,6 @@ semantics consistent, upstream changes must:
 Buoy grammar/FFI and built-in backend contracts were read from installed
 `/usr/share/buoy/docs/documentation/{ffi-declare,declare-selector,cstring,optional-declare,graphics,pdf,strings,standard-library}.md`.
 
-## Native macOS evidence
+## macOS integration
 
-The reproducible macOS verifier
-passed the ARM64 native suite, six independent CoreText identity/metric cases,
-and stock Picture/PDF execution. All sealed package consumers now build and run
-with stock linker resources: only the small SDK-built dylib links Core Text,
-and test-only NaN/infinity fixtures use IEEE-754 bytes plus `memcpy`, without
-`atof`. The standalone upstream CoreText and `_atof` repros remain unchanged;
-they still fail with stock stubs and pass their individual temporary overlays.
-A checksum-verified official installer independently confirms both upstream stub
-omissions. The package bridge is a local workaround, not an upstream fix.
-Installed toolchain files remain untouched.
-Intel macOS execution remains unverified.
+The macOS implementation uses an SDK-built Core Text bridge and returns copied font identity and metric snapshots. Intel macOS native execution remains unverified.
