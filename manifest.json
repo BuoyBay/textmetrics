@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "textmetrics",
   "version": "0.1.0",
-  "description": "Explicit font requests, native base-face resolution and logical-point metrics",
+  "description": "Resolve fonts and measure text in logical points",
   "libraries": [
     {
       "libName": "buoy_textmetrics",
